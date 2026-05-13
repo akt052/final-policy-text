@@ -1,11 +1,12 @@
 import os
-import pickle
+import re
 import warnings
-from collections import defaultdict
 
 warnings.filterwarnings("ignore")
 
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
+
+import imageio
 
 import gymnasium as gym
 import minigrid
@@ -15,26 +16,24 @@ import torch.nn as nn
 
 
 # =====================================================
-# 1. LOAD DATASET
+# 1. NORMALIZE INSTRUCTION
 # =====================================================
 
-with open("data/demos/gotolocal_seq.pkl", "rb") as f:
-    data = pickle.load(f)
+def normalize_instruction(instr):
 
+    instr = instr.lower()
 
-# =====================================================
-# 2. GROUP DATASET
-# =====================================================
+    instr = re.sub(
+        r"\bgo to a (\w+ \w+)\b",
+        r"go to the \1",
+        instr
+    )
 
-grouped = defaultdict(list)
-
-for traj in data:
-
-    grouped[traj["instruction"]].append(traj)
+    return instr.strip()
 
 
 # =====================================================
-# 3. BUILD VOCAB
+# 2. BUILD VOCAB
 # =====================================================
 
 SPECIAL_TOKENS = {
@@ -44,11 +43,35 @@ SPECIAL_TOKENS = {
 
 vocab = dict(SPECIAL_TOKENS)
 
-for traj in data:
+instructions = [
+    "go to the blue ball",
+    "go to the blue box",
+    "go to the blue key",
 
-    tokens = traj["instruction"].lower().split()
+    "go to the green ball",
+    "go to the green box",
+    "go to the green key",
 
-    for token in tokens:
+    "go to the grey ball",
+    "go to the grey box",
+    "go to the grey key",
+
+    "go to the purple ball",
+    "go to the purple box",
+    "go to the purple key",
+
+    "go to the red ball",
+    "go to the red box",
+    "go to the red key",
+
+    "go to the yellow ball",
+    "go to the yellow box",
+    "go to the yellow key"
+]
+
+for instr in instructions:
+
+    for token in instr.split():
 
         if token not in vocab:
 
@@ -56,7 +79,7 @@ for traj in data:
 
 
 # =====================================================
-# 4. TOKENIZER
+# 3. TOKENIZER
 # =====================================================
 
 MAX_INSTR_LEN = 10
@@ -82,7 +105,7 @@ def tokenize_instruction(instr):
 
 
 # =====================================================
-# 5. FiLM BLOCK
+# 4. FiLM BLOCK
 # =====================================================
 
 class FiLMBlock(nn.Module):
@@ -117,7 +140,7 @@ class FiLMBlock(nn.Module):
 
 
 # =====================================================
-# 6. BABYAI MODEL
+# 5. BABYAI MODEL
 # =====================================================
 
 class BabyAIModel(nn.Module):
@@ -285,7 +308,7 @@ class BabyAIModel(nn.Module):
 
 
 # =====================================================
-# 7. DEVICE
+# 6. DEVICE
 # =====================================================
 
 device = torch.device(
@@ -297,39 +320,36 @@ print("Using device:", device)
 
 
 # =====================================================
-# 8. ENVIRONMENT
+# 7. ENVIRONMENT
 # =====================================================
 
 env = gym.make(
     "BabyAI-GoToLocal-v0",
-    render_mode=None
+    render_mode="rgb_array"
 )
 
 env = env.unwrapped
 
 
 # =====================================================
-# 9. MODEL FILES
+# 8. MODEL DIRECTORY
 # =====================================================
 
 model_dir = "data/models"
 
-model_files = [
+model_files = sorted([
     f for f in os.listdir(model_dir)
     if f.endswith(".pt")
-]
+])
 
-model_files.sort()
+print("\nFound models:", len(model_files))
 
 
 # =====================================================
-# 10. EVALUATION
+# 9. GENERATE GIF
 # =====================================================
 
-episodes_per_model = 100
-
-results = {}
-
+all_frames = []
 
 for model_file in model_files:
 
@@ -337,19 +357,26 @@ for model_file in model_files:
     # RECOVER INSTRUCTION
     # =====================================
 
-    instruction = (
-        model_file
-        .replace(".pt", "")
-        .replace("_", " ")
+    instruction = model_file.replace(".pt", "")
+
+    instruction = instruction.replace("_", " ")
+
+    instruction = normalize_instruction(
+        instruction
     )
 
-    print("\n========================")
-    print("Evaluating:", instruction)
-    print("========================")
+    print("\n====================")
+    print("Instruction:", instruction)
+    print("====================")
 
     # =====================================
     # LOAD MODEL
     # =====================================
+
+    model_path = os.path.join(
+        model_dir,
+        model_file
+    )
 
     model = BabyAIModel(
         vocab_size=len(vocab)
@@ -357,7 +384,7 @@ for model_file in model_files:
 
     model.load_state_dict(
         torch.load(
-            os.path.join(model_dir, model_file),
+            model_path,
             map_location=device
         )
     )
@@ -365,7 +392,7 @@ for model_file in model_files:
     model.eval()
 
     # =====================================
-    # TOKENIZE INSTRUCTION
+    # ENCODE INSTRUCTION
     # =====================================
 
     instr_tensor = torch.tensor(
@@ -380,162 +407,137 @@ for model_file in model_files:
         )
 
     # =====================================
-    # OFFLINE ACCURACY
+    # RESET UNTIL MATCHING MISSION
     # =====================================
 
-    correct = 0
-    total = 0
+    while True:
 
-    trajectories = grouped[instruction]
+        obs, _ = env.reset()
 
-    with torch.no_grad():
+        mission = normalize_instruction(
+            env.mission
+        )
 
-        for traj in trajectories:
+        if mission == instruction:
+            break
 
-            hx = torch.zeros(
-                1,
-                128,
-                device=device
-            )
+    print("Environment Mission:", mission)
 
-            cx = torch.zeros(
-                1,
-                128,
-                device=device
-            )
+    # =====================================
+    # INITIAL LSTM STATE
+    # =====================================
 
-            for obs, expert_action in zip(
-                traj["obs_seq"],
-                traj["act_seq"]
-            ):
+    hx = torch.zeros(
+        1,
+        128,
+        device=device
+    )
 
-                obs = torch.tensor(
-                    obs,
-                    dtype=torch.float32
-                ).unsqueeze(0) / 255.0
-
-                obs = obs.to(device)
-
-                logits, hx, cx = model.forward_step(
-                    instr_embedding,
-                    obs,
-                    hx,
-                    cx
-                )
-
-                pred_action = torch.argmax(
-                    logits,
-                    dim=1
-                ).item()
-
-                if pred_action == expert_action:
-
-                    correct += 1
-
-                total += 1
-
-    accuracy = correct / total
-
-    print(
-        f"Offline Accuracy: "
-        f"{accuracy * 100:.2f}%"
+    cx = torch.zeros(
+        1,
+        128,
+        device=device
     )
 
     # =====================================
-    # ROLLOUT EVALUATION
+    # ROLLOUT
     # =====================================
 
-    success = 0
+    done = False
 
-    for ep in range(episodes_per_model):
+    reward = 0
 
-        while True:
+    steps = 0
 
-            obs, _ = env.reset()
+    max_steps = 150
 
-            if env.mission == instruction:
-                break
+    while not done and steps < max_steps:
 
-        hx = torch.zeros(
-            1,
-            128,
-            device=device
+        # ---------------------------------
+        # SAVE FRAME
+        # ---------------------------------
+
+        frame = env.get_frame(
+            highlight=True,
+            tile_size=32
         )
 
-        cx = torch.zeros(
-            1,
-            128,
-            device=device
-        )
+        all_frames.append(frame)
 
-        done = False
+        # ---------------------------------
+        # MODEL ACTION
+        # ---------------------------------
 
-        while not done:
+        img = torch.tensor(
+            obs["image"],
+            dtype=torch.float32
+        ).unsqueeze(0) / 255.0
 
-            img = obs["image"]
+        img = img.to(device)
 
-            img = torch.tensor(
+        with torch.no_grad():
+
+            logits, hx, cx = model.forward_step(
+                instr_embedding,
                 img,
-                dtype=torch.float32
-            ).unsqueeze(0) / 255.0
+                hx,
+                cx
+            )
 
-            img = img.to(device)
+            action = torch.argmax(
+                logits,
+                dim=1
+            ).item()
 
-            with torch.no_grad():
+        # ---------------------------------
+        # STEP ENVIRONMENT
+        # ---------------------------------
 
-                logits, hx, cx = model.forward_step(
-                    instr_embedding,
-                    img,
-                    hx,
-                    cx
-                )
+        obs, reward, terminated, truncated, _ = env.step(action)
 
-                action = torch.argmax(
-                    logits,
-                    dim=1
-                ).item()
+        done = terminated or truncated
 
-            obs, reward, terminated, truncated, _ = env.step(action)
+        steps += 1
 
-            done = terminated or truncated
+    # =====================================
+    # FINAL FRAME
+    # =====================================
 
-        if reward > 0:
-
-            success += 1
-
-    success_rate = success / episodes_per_model
-
-    print(
-        f"Rollout Success Rate: "
-        f"{success_rate * 100:.2f}%"
+    frame = env.get_frame(
+        highlight=True,
+        tile_size=32
     )
 
+    all_frames.append(frame)
+
+    print("Reward:", reward)
+
+    print("Success:", reward > 0)
+
+    print("Steps:", steps)
+
     # =====================================
-    # STORE RESULTS
+    # PAUSE BETWEEN EPISODES
     # =====================================
 
-    results[instruction] = {
-        "accuracy": accuracy,
-        "success_rate": success_rate
-    }
+    for _ in range(10):
+
+        all_frames.append(frame)
 
 
 # =====================================================
-# 11. FINAL RESULTS
+# 10. SAVE GIF
 # =====================================================
 
-print("\n========================")
-print("FINAL RESULTS")
-print("========================")
+output_path = "all_policies.gif"
 
-for instr in results:
+imageio.mimsave(
+    output_path,
+    all_frames,
+    fps=5,
+    loop=0
+)
 
-    acc = results[instr]["accuracy"] * 100
-    sr = results[instr]["success_rate"] * 100
-
-    print(
-        f"{instr}"
-        f"\n  Accuracy      : {acc:.2f}%"
-        f"\n  Success Rate  : {sr:.2f}%"
-        f"\n"
-    )
+print("\n================================")
+print("Saved GIF:", output_path)
+print("================================")

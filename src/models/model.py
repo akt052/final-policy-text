@@ -7,28 +7,25 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
 
 
-# =====================
-# 1. Load Dataset
-# =====================
+# =====================================================
+# 1. LOAD DATASET
+# =====================================================
 
 with open("data/demos/gotolocal_seq.pkl", "rb") as f:
     data = pickle.load(f)
 
+print("Total trajectories:", len(data))
 
-# =====================
-# 2. Group by Instruction
-# =====================
+
+# =====================================================
+# 2. GROUP BY INSTRUCTION
+# =====================================================
 
 grouped = defaultdict(list)
 
-for d in data:
+for traj in data:
 
-    instr = d["instruction"]
-
-    for obs, act in zip(d["obs_seq"], d["act_seq"]):
-
-        grouped[instr].append((obs, act))
-
+    grouped[traj["instruction"]].append(traj)
 
 print("Total Instructions:", len(grouped))
 
@@ -36,91 +33,292 @@ for k in grouped:
     print(k, "→", len(grouped[k]))
 
 
-# =====================
-# 3. Dataset
-# =====================
+# =====================================================
+# 3. BUILD VOCAB
+# =====================================================
 
-class PolicyDataset(Dataset):
+SPECIAL_TOKENS = {
+    "<pad>": 0,
+    "<unk>": 1
+}
 
-    def __init__(self, pairs):
+vocab = dict(SPECIAL_TOKENS)
 
-        self.X = [p[0] for p in pairs]
-        self.Y = [p[1] for p in pairs]
+for traj in data:
+
+    tokens = traj["instruction"].lower().split()
+
+    for token in tokens:
+
+        if token not in vocab:
+
+            vocab[token] = len(vocab)
+
+print("Vocab Size:", len(vocab))
+
+
+# =====================================================
+# 4. TOKENIZER
+# =====================================================
+
+MAX_INSTR_LEN = 10
+
+
+def tokenize_instruction(instr):
+
+    tokens = instr.lower().split()
+
+    ids = []
+
+    for tok in tokens:
+
+        ids.append(
+            vocab.get(tok, vocab["<unk>"])
+        )
+
+    while len(ids) < MAX_INSTR_LEN:
+
+        ids.append(vocab["<pad>"])
+
+    return ids[:MAX_INSTR_LEN]
+
+
+# =====================================================
+# 5. TRAJECTORY DATASET
+# =====================================================
+
+class TrajectoryDataset(Dataset):
+
+    def __init__(self, trajectories):
+
+        self.trajectories = trajectories
 
     def __len__(self):
 
-        return len(self.X)
+        return len(self.trajectories)
 
     def __getitem__(self, idx):
 
-        obs = torch.tensor(
-            self.X[idx],
+        traj = self.trajectories[idx]
+
+        instr = tokenize_instruction(
+            traj["instruction"]
+        )
+
+        obs_seq = torch.tensor(
+            traj["obs_seq"],
             dtype=torch.float32
         ) / 255.0
 
-        act = torch.tensor(
-            self.Y[idx],
+        act_seq = torch.tensor(
+            traj["act_seq"],
             dtype=torch.long
         )
 
-        return obs, act
+        instr = torch.tensor(
+            instr,
+            dtype=torch.long
+        )
+
+        return instr, obs_seq, act_seq
 
 
-# =====================
-# 4. Improved CNN
-# =====================
+# =====================================================
+# 6. COLLATE FUNCTION
+# =====================================================
 
-class PolicyNet(nn.Module):
+def collate_fn(batch):
 
-    def __init__(self, n_actions=7):
+    instrs = []
+    obs_seqs = []
+    act_seqs = []
+    lengths = []
+
+    for instr, obs_seq, act_seq in batch:
+
+        instrs.append(instr)
+
+        obs_seqs.append(obs_seq)
+
+        act_seqs.append(act_seq)
+
+        lengths.append(len(obs_seq))
+
+    max_len = max(lengths)
+
+    padded_obs = []
+    padded_act = []
+
+    for obs_seq, act_seq in zip(obs_seqs, act_seqs):
+
+        pad_len = max_len - len(obs_seq)
+
+        if pad_len > 0:
+
+            obs_pad = torch.zeros(
+                pad_len,
+                7,
+                7,
+                3
+            )
+
+            act_pad = torch.zeros(
+                pad_len,
+                dtype=torch.long
+            )
+
+            obs_seq = torch.cat(
+                [obs_seq, obs_pad],
+                dim=0
+            )
+
+            act_seq = torch.cat(
+                [act_seq, act_pad],
+                dim=0
+            )
+
+        padded_obs.append(obs_seq)
+        padded_act.append(act_seq)
+
+    return (
+        torch.stack(instrs),
+        torch.stack(padded_obs),
+        torch.stack(padded_act),
+        lengths
+    )
+
+
+# =====================================================
+# 7. FiLM BLOCK
+# =====================================================
+
+class FiLMBlock(nn.Module):
+
+    def __init__(self, instr_dim, channels):
 
         super().__init__()
 
-        self.conv = nn.Sequential(
-
-            # 7x7 -> 7x7
-            nn.Conv2d(
-                3,
-                32,
-                kernel_size=3,
-                stride=1,
-                padding=1
-            ),
-
-            nn.BatchNorm2d(32),
-
-            nn.ReLU(),
-
-            # 7x7 -> 7x7
-            nn.Conv2d(
-                32,
-                64,
-                kernel_size=3,
-                stride=1,
-                padding=1
-            ),
-
-            nn.BatchNorm2d(64),
-
-            nn.ReLU(),
-
-            # IMPORTANT:
-            # no pooling to preserve spatial info
+        self.gamma = nn.Linear(
+            instr_dim,
+            channels
         )
 
-        self.fc = nn.Sequential(
+        self.beta = nn.Linear(
+            instr_dim,
+            channels
+        )
 
-            nn.Linear(
-                64 * 7 * 7,
-                256
+    def forward(self, x, instr_embedding):
+
+        gamma = self.gamma(instr_embedding)
+        beta = self.beta(instr_embedding)
+
+        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+        beta = beta.unsqueeze(-1).unsqueeze(-1)
+
+        return gamma * x + beta
+
+
+# =====================================================
+# 8. BABYAI POLICY MODEL
+# =====================================================
+
+class BabyAIModel(nn.Module):
+
+    def __init__(self,
+                 vocab_size,
+                 n_actions=7):
+
+        super().__init__()
+
+        # =====================================
+        # WORD EMBEDDING
+        # =====================================
+
+        self.word_embedding = nn.Embedding(
+            vocab_size,
+            128
+        )
+
+        # =====================================
+        # GRU
+        # =====================================
+
+        self.gru = nn.GRU(
+            input_size=128,
+            hidden_size=128,
+            batch_first=True
+        )
+
+        # =====================================
+        # CNN
+        # =====================================
+
+        self.conv1 = nn.Sequential(
+
+            nn.Conv2d(
+                3,
+                128,
+                kernel_size=2,
+                stride=1,
+                padding=1
             ),
+
+            nn.BatchNorm2d(128),
 
             nn.ReLU(),
 
-            nn.Dropout(0.2),
+            nn.MaxPool2d(2, 2)
+        )
+
+        self.conv2 = nn.Sequential(
+
+            nn.Conv2d(
+                128,
+                128,
+                kernel_size=3,
+                stride=1,
+                padding=1
+            ),
+
+            nn.BatchNorm2d(128),
+
+            nn.ReLU(),
+
+            nn.MaxPool2d(2, 2)
+        )
+
+        # =====================================
+        # FiLM
+        # =====================================
+
+        self.film1 = FiLMBlock(
+            128,
+            128
+        )
+
+        self.film2 = FiLMBlock(
+            128,
+            128
+        )
+
+        # =====================================
+        # LSTM
+        # =====================================
+
+        self.lstm = nn.LSTMCell(
+            input_size=128 * 2 * 2,
+            hidden_size=128
+        )
+
+        # =====================================
+        # POLICY HEAD
+        # =====================================
+
+        self.policy = nn.Sequential(
 
             nn.Linear(
-                256,
+                128,
                 128
             ),
 
@@ -132,29 +330,106 @@ class PolicyNet(nn.Module):
             )
         )
 
-    def forward(self, x):
+    def encode_instruction(self, instr):
 
-        # (B,7,7,3) -> (B,3,7,7)
-        x = x.permute(0, 3, 1, 2)
+        emb = self.word_embedding(instr)
 
-        x = self.conv(x)
+        _, hidden = self.gru(emb)
+
+        return hidden.squeeze(0)
+
+    def encode_obs(self,
+                   obs,
+                   instr_embedding):
+
+        obs = obs.permute(0, 3, 1, 2)
+
+        x = self.conv1(obs)
+
+        x = self.film1(
+            x,
+            instr_embedding
+        )
+
+        x = self.conv2(x)
+
+        x = self.film2(
+            x,
+            instr_embedding
+        )
 
         x = x.reshape(x.size(0), -1)
 
-        logits = self.fc(x)
+        return x
 
-        return logits
+    def forward(self,
+                instr,
+                obs_seq,
+                lengths):
+
+        batch_size = obs_seq.size(0)
+        seq_len = obs_seq.size(1)
+
+        instr_embedding = self.encode_instruction(
+            instr
+        )
+
+        hx = torch.zeros(
+            batch_size,
+            128,
+            device=obs_seq.device
+        )
+
+        cx = torch.zeros(
+            batch_size,
+            128,
+            device=obs_seq.device
+        )
+
+        outputs = []
+
+        for t in range(seq_len):
+
+            obs_t = obs_seq[:, t]
+
+            x = self.encode_obs(
+                obs_t,
+                instr_embedding
+            )
+
+            hx, cx = self.lstm(
+                x,
+                (hx, cx)
+            )
+
+            logits = self.policy(hx)
+
+            outputs.append(logits)
+
+        outputs = torch.stack(
+            outputs,
+            dim=1
+        )
+
+        return outputs
 
 
-# =====================
-# 5. Training Function
-# =====================
+# =====================================================
+# 9. TRAIN FUNCTION
+# =====================================================
 
-def train_model(pairs, instruction, device):
+def train_model(instruction,
+                trajectories,
+                device):
 
-    dataset = PolicyDataset(pairs)
+    print("\n========================")
+    print("Training:", instruction)
+    print("========================")
 
-    # 90 / 10 split
+    dataset = TrajectoryDataset(
+        trajectories
+    )
+
     val_size = int(0.1 * len(dataset))
     train_size = len(dataset) - val_size
 
@@ -165,39 +440,41 @@ def train_model(pairs, instruction, device):
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=64,
-        shuffle=True
+        batch_size=16,
+        shuffle=True,
+        collate_fn=collate_fn
     )
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=64,
-        shuffle=False
+        batch_size=16,
+        shuffle=False,
+        collate_fn=collate_fn
     )
 
-    model = PolicyNet().to(device)
+    model = BabyAIModel(
+        vocab_size=len(vocab)
+    ).to(device)
 
     optimizer = torch.optim.Adam(
         model.parameters(),
-        lr=1e-3
+        lr=1e-4
     )
 
     loss_fn = nn.CrossEntropyLoss()
 
-    # Early stopping
-    max_epochs = 50
-    patience = 5
-
     best_val_loss = float("inf")
-    best_model_state = None
 
+    patience = 5
     patience_counter = 0
+
+    max_epochs = 50
 
     for epoch in range(max_epochs):
 
-        # =====================
+        # =====================================
         # TRAIN
-        # =====================
+        # =====================================
 
         model.train()
 
@@ -206,14 +483,29 @@ def train_model(pairs, instruction, device):
         train_correct = 0
         train_total = 0
 
-        for obs, act in train_loader:
+        for instr, obs_seq, act_seq, lengths in train_loader:
 
-            obs = obs.to(device)
-            act = act.to(device)
+            instr = instr.to(device)
+            obs_seq = obs_seq.to(device)
+            act_seq = act_seq.to(device)
 
-            logits = model(obs)
+            logits = model(
+                instr,
+                obs_seq,
+                lengths
+            )
 
-            loss = loss_fn(logits, act)
+            logits = logits.reshape(
+                -1,
+                7
+            )
+
+            targets = act_seq.reshape(-1)
+
+            loss = loss_fn(
+                logits,
+                targets
+            )
 
             optimizer.zero_grad()
 
@@ -223,17 +515,22 @@ def train_model(pairs, instruction, device):
 
             train_loss += loss.item()
 
-            preds = torch.argmax(logits, dim=1)
+            preds = torch.argmax(
+                logits,
+                dim=1
+            )
 
-            train_correct += (preds == act).sum().item()
+            train_correct += (
+                preds == targets
+            ).sum().item()
 
-            train_total += act.size(0)
+            train_total += targets.size(0)
 
         train_acc = train_correct / train_total
 
-        # =====================
+        # =====================================
         # VALIDATION
-        # =====================
+        # =====================================
 
         model.eval()
 
@@ -244,27 +541,46 @@ def train_model(pairs, instruction, device):
 
         with torch.no_grad():
 
-            for obs, act in val_loader:
+            for instr, obs_seq, act_seq, lengths in val_loader:
 
-                obs = obs.to(device)
-                act = act.to(device)
+                instr = instr.to(device)
+                obs_seq = obs_seq.to(device)
+                act_seq = act_seq.to(device)
 
-                logits = model(obs)
+                logits = model(
+                    instr,
+                    obs_seq,
+                    lengths
+                )
 
-                loss = loss_fn(logits, act)
+                logits = logits.reshape(
+                    -1,
+                    7
+                )
+
+                targets = act_seq.reshape(-1)
+
+                loss = loss_fn(
+                    logits,
+                    targets
+                )
 
                 val_loss += loss.item()
 
-                preds = torch.argmax(logits, dim=1)
+                preds = torch.argmax(
+                    logits,
+                    dim=1
+                )
 
-                val_correct += (preds == act).sum().item()
+                val_correct += (
+                    preds == targets
+                ).sum().item()
 
-                val_total += act.size(0)
+                val_total += targets.size(0)
 
         val_acc = val_correct / val_total
 
         print(
-            f"{instruction} | "
             f"Epoch {epoch+1} | "
             f"Train Loss: {train_loss:.4f} | "
             f"Train Acc: {train_acc*100:.2f}% | "
@@ -272,15 +588,29 @@ def train_model(pairs, instruction, device):
             f"Val Acc: {val_acc*100:.2f}%"
         )
 
-        # =====================
+        # =====================================
         # EARLY STOPPING
-        # =====================
+        # =====================================
 
         if val_loss < best_val_loss:
 
             best_val_loss = val_loss
 
-            best_model_state = model.state_dict()
+            save_name = (
+                instruction
+                .replace(" ", "_")
+                + ".pt"
+            )
+
+            save_path = os.path.join(
+                "data/models",
+                save_name
+            )
+
+            torch.save(
+                model.state_dict(),
+                save_path
+            )
 
             patience_counter = 0
 
@@ -290,56 +620,35 @@ def train_model(pairs, instruction, device):
 
         if patience_counter >= patience:
 
-            print(f"Early stopping triggered for {instruction}")
+            print("Early stopping triggered")
 
             break
 
-    # restore best model
-    model.load_state_dict(best_model_state)
 
-    return model
-
-
-# =====================
-# 6. Train All Models
-# =====================
+# =====================================================
+# 10. TRAIN ALL 18 MODELS
+# =====================================================
 
 device = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
+    "cuda" if torch.cuda.is_available()
+    else "cpu"
 )
 
 print("\nUsing device:", device)
 
-os.makedirs("data/models", exist_ok=True)
+os.makedirs(
+    "data/models",
+    exist_ok=True
+)
 
+for instruction in grouped:
 
-for instr in grouped:
+    trajectories = grouped[instruction]
 
-    print("\n========================")
-    print("Training:", instr)
-    print("========================")
-
-    pairs = grouped[instr]
-
-    model = train_model(
-        pairs,
-        instr,
+    train_model(
+        instruction,
+        trajectories,
         device
     )
 
-    fname = instr.replace(" ", "_") + ".pt"
-
-    save_path = os.path.join(
-        "data/models",
-        fname
-    )
-
-    torch.save(
-        model.state_dict(),
-        save_path
-    )
-
-    print("Saved:", save_path)
-
-
-print("\nAll models trained successfully.")
+print("\nAll 18 models trained.")
